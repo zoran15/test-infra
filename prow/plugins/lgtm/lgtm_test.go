@@ -47,10 +47,6 @@ type fakeOwnersClient struct {
 
 var _ repoowners.Interface = &fakeOwnersClient{}
 
-func (f *fakeOwnersClient) LoadRepoAliases(org, repo, base string) (repoowners.RepoAliases, error) {
-	return nil, nil
-}
-
 func (f *fakeOwnersClient) LoadRepoOwners(org, repo, base string) (repoowners.RepoOwner, error) {
 	return &fakeRepoOwners{approvers: f.approvers, reviewers: f.reviewers}, nil
 }
@@ -64,9 +60,9 @@ func (f *fakeOwnersClient) WithGitHubClient(client github.Client) repoowners.Int
 }
 
 type fakeRepoOwners struct {
-	approvers    map[string]layeredsets.String
-	reviewers    map[string]layeredsets.String
-	dirBlacklist []*regexp.Regexp
+	approvers   map[string]layeredsets.String
+	reviewers   map[string]layeredsets.String
+	dirDenylist []*regexp.Regexp
 }
 
 func (f *fakeRepoOwners) Filenames() ownersconfig.Filenames {
@@ -88,20 +84,21 @@ func (fp *fakePruner) PruneComments(shouldPrune func(github.IssueComment) bool) 
 
 var _ repoowners.RepoOwner = &fakeRepoOwners{}
 
-func (f *fakeRepoOwners) FindApproverOwnersForFile(path string) string  { return "" }
-func (f *fakeRepoOwners) FindReviewersOwnersForFile(path string) string { return "" }
-func (f *fakeRepoOwners) FindLabelsForFile(path string) sets.String     { return nil }
-func (f *fakeRepoOwners) IsNoParentOwners(path string) bool             { return false }
-func (f *fakeRepoOwners) LeafApprovers(path string) sets.String         { return nil }
-func (f *fakeRepoOwners) Approvers(path string) layeredsets.String      { return f.approvers[path] }
-func (f *fakeRepoOwners) LeafReviewers(path string) sets.String         { return nil }
-func (f *fakeRepoOwners) Reviewers(path string) layeredsets.String      { return f.reviewers[path] }
-func (f *fakeRepoOwners) RequiredReviewers(path string) sets.String     { return nil }
-func (f *fakeRepoOwners) TopLevelApprovers() sets.String                { return nil }
+func (f *fakeRepoOwners) FindApproverOwnersForFile(path string) string    { return "" }
+func (f *fakeRepoOwners) FindReviewersOwnersForFile(path string) string   { return "" }
+func (f *fakeRepoOwners) FindLabelsForFile(path string) sets.String       { return nil }
+func (f *fakeRepoOwners) IsNoParentOwners(path string) bool               { return false }
+func (f *fakeRepoOwners) IsAutoApproveUnownedSubfolders(path string) bool { return false }
+func (f *fakeRepoOwners) LeafApprovers(path string) sets.String           { return nil }
+func (f *fakeRepoOwners) Approvers(path string) layeredsets.String        { return f.approvers[path] }
+func (f *fakeRepoOwners) LeafReviewers(path string) sets.String           { return nil }
+func (f *fakeRepoOwners) Reviewers(path string) layeredsets.String        { return f.reviewers[path] }
+func (f *fakeRepoOwners) RequiredReviewers(path string) sets.String       { return nil }
+func (f *fakeRepoOwners) TopLevelApprovers() sets.String                  { return nil }
 
 func (f *fakeRepoOwners) ParseSimpleConfig(path string) (repoowners.SimpleConfig, error) {
 	dir := filepath.Dir(path)
-	for _, re := range f.dirBlacklist {
+	for _, re := range f.dirDenylist {
 		if re.MatchString(dir) {
 			return repoowners.SimpleConfig{}, filepath.SkipDir
 		}
@@ -118,7 +115,7 @@ func (f *fakeRepoOwners) ParseSimpleConfig(path string) (repoowners.SimpleConfig
 
 func (f *fakeRepoOwners) ParseFullConfig(path string) (repoowners.FullConfig, error) {
 	dir := filepath.Dir(path)
-	for _, re := range f.dirBlacklist {
+	for _, re := range f.dirDenylist {
 		if re.MatchString(dir) {
 			return repoowners.FullConfig{}, filepath.SkipDir
 		}
@@ -201,6 +198,15 @@ func TestLGTMComment(t *testing.T) {
 			shouldComment: false,
 		},
 		{
+			name:          "remove lgtm by author",
+			body:          "/remove-lgtm",
+			commenter:     "author",
+			hasLGTM:       true,
+			shouldToggle:  true,
+			shouldAssign:  false,
+			shouldComment: false,
+		},
+		{
 			name:          "lgtm comment by non-reviewer",
 			body:          "/lgtm",
 			commenter:     "collab2",
@@ -255,8 +261,26 @@ func TestLGTMComment(t *testing.T) {
 			shouldAssign:  true,
 		},
 		{
+			name:          "remove lgtm by non-reviewer",
+			body:          "/remove-lgtm",
+			commenter:     "collab2",
+			hasLGTM:       true,
+			shouldToggle:  true,
+			shouldComment: false,
+			shouldAssign:  true,
+		},
+		{
 			name:          "lgtm cancel by rando",
 			body:          "/lgtm cancel",
+			commenter:     "not-in-the-org",
+			hasLGTM:       true,
+			shouldToggle:  false,
+			shouldComment: true,
+			shouldAssign:  false,
+		},
+		{
+			name:          "remove lgtm by rando",
+			body:          "/remove-lgtm",
 			commenter:     "not-in-the-org",
 			hasLGTM:       true,
 			shouldToggle:  false,
@@ -271,6 +295,13 @@ func TestLGTMComment(t *testing.T) {
 			shouldToggle: true,
 		},
 		{
+			name:         "remove-lgtm comment by reviewer",
+			body:         "/remove-lgtm",
+			commenter:    "collab1",
+			hasLGTM:      true,
+			shouldToggle: true,
+		},
+		{
 			name:         "lgtm cancel comment by reviewer, with trailing space",
 			body:         "/lgtm cancel \r",
 			commenter:    "collab1",
@@ -278,8 +309,22 @@ func TestLGTMComment(t *testing.T) {
 			shouldToggle: true,
 		},
 		{
+			name:         "remove lgtm comment by reviewer, with trailing space",
+			body:         "/remove-lgtm \r",
+			commenter:    "collab1",
+			hasLGTM:      true,
+			shouldToggle: true,
+		},
+		{
 			name:         "lgtm cancel comment by reviewer, no lgtm",
 			body:         "/lgtm cancel",
+			commenter:    "collab1",
+			hasLGTM:      false,
+			shouldToggle: false,
+		},
+		{
+			name:         "remove lgtm comment by reviewer, no lgtm",
+			body:         "/remove-lgtm",
 			commenter:    "collab1",
 			hasLGTM:      false,
 			shouldToggle: false,
@@ -461,6 +506,12 @@ func TestLGTMCommentWithLGTMNoti(t *testing.T) {
 		{
 			name:         "lgtm cancel comment by reviewer, no lgtm",
 			body:         "/lgtm cancel",
+			commenter:    "collab1",
+			shouldDelete: false,
+		},
+		{
+			name:         "remove-lgtm comment by reviewer, no lgtm",
+			body:         "/remove-lgtm",
 			commenter:    "collab1",
 			shouldDelete: false,
 		},

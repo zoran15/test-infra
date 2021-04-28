@@ -47,6 +47,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 	corev1 "k8s.io/client-go/kubernetes/typed/core/v1"
+	"k8s.io/test-infra/prow/pjutil/pprof"
 	ctrlruntimeclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/yaml"
@@ -57,6 +58,7 @@ import (
 	"k8s.io/test-infra/prow/config/secret"
 	"k8s.io/test-infra/prow/deck/jobs"
 	prowflagutil "k8s.io/test-infra/prow/flagutil"
+	configflagutil "k8s.io/test-infra/prow/flagutil/config"
 	"k8s.io/test-infra/prow/git/v2"
 	prowgithub "k8s.io/test-infra/prow/github"
 	"k8s.io/test-infra/prow/githuboauth"
@@ -80,7 +82,9 @@ import (
 	"k8s.io/test-infra/prow/spyglass/lenses"
 	_ "k8s.io/test-infra/prow/spyglass/lenses/buildlog"
 	_ "k8s.io/test-infra/prow/spyglass/lenses/coverage"
+	_ "k8s.io/test-infra/prow/spyglass/lenses/html"
 	_ "k8s.io/test-infra/prow/spyglass/lenses/junit"
+	_ "k8s.io/test-infra/prow/spyglass/lenses/links"
 	_ "k8s.io/test-infra/prow/spyglass/lenses/metadata"
 	_ "k8s.io/test-infra/prow/spyglass/lenses/podinfo"
 	_ "k8s.io/test-infra/prow/spyglass/lenses/restcoverage"
@@ -99,8 +103,7 @@ const (
 )
 
 type options struct {
-	configPath            string
-	jobConfigPath         string
+	config                configflagutil.ConfigOptions
 	instrumentation       prowflagutil.InstrumentationOptions
 	kubernetes            prowflagutil.KubernetesOptions
 	github                prowflagutil.GitHubOptions
@@ -134,19 +137,8 @@ func (o *options) Validate() error {
 		return err
 	}
 
-	if o.configPath == "" {
-		return errors.New("required flag --config-path was unset")
-	}
-
-	// TODO(Katharine): remove this handling after 2019-10-31
-	// We used to set a default value for --cookie-secret-file, but we also have code that
-	// assumes we don't. If it's not set, but it is required that it is, and a file exists
-	// at the old default, we set it back to that default and emit an error.
-	if o.cookieSecretFile == "" && o.oauthURL != "" {
-		if _, err := os.Stat("/etc/cookie/secret"); err == nil {
-			o.cookieSecretFile = "/etc/cookie/secret"
-			logrus.Error("You haven't set --cookie-secret, but you're assuming it is set to '/etc/cookie/secret'. Add --cookie-secret=/etc/cookie/secret to your deck instance's arguments. Your configuration will stop working at the end of October 2019.")
-		}
+	if err := o.config.Validate(o.dryRun); err != nil {
+		return err
 	}
 
 	if o.oauthURL != "" {
@@ -172,8 +164,6 @@ func (o *options) Validate() error {
 
 func gatherOptions(fs *flag.FlagSet, args ...string) options {
 	var o options
-	fs.StringVar(&o.configPath, "config-path", "", "Path to config.yaml.")
-	fs.StringVar(&o.jobConfigPath, "job-config-path", "", "Path to prow job configs.")
 	fs.StringVar(&o.tideURL, "tide-url", "", "Path to tide. If empty, do not serve tide data.")
 	fs.StringVar(&o.hookURL, "hook-url", "", "Path to hook plugin help endpoint.")
 	fs.StringVar(&o.oauthURL, "oauth-url", "", "Path to deck user dashboard endpoint.")
@@ -195,6 +185,7 @@ func gatherOptions(fs *flag.FlagSet, args ...string) options {
 	fs.BoolVar(&o.allowInsecure, "allow-insecure", false, "Allows insecure requests for CSRF and GitHub oauth.")
 	fs.BoolVar(&o.dryRun, "dry-run", false, "Whether or not to make mutating API calls to GitHub.")
 	fs.StringVar(&o.pluginConfig, "plugin-config", "", "Path to plugin config file, probably /etc/plugins/plugins.yaml")
+	o.config.AddFlags(fs)
 	o.instrumentation.AddFlags(fs)
 	o.kubernetes.AddFlags(fs)
 	o.github.AddFlags(fs)
@@ -246,13 +237,13 @@ var simplifier = simplifypath.NewSimplifier(l("", // shadow element mimicing the
 	l("rerun"),
 	l("spyglass",
 		l("static",
-			v("path")),
+			simplifypath.VGreedy("path")),
 		l("lens",
 			v("lens",
 				v("job")),
 		)),
 	l("static",
-		v("path")),
+		simplifypath.VGreedy("path")),
 	l("tide"),
 	l("tide-history"),
 	l("tide-history.js"),
@@ -280,11 +271,11 @@ func main() {
 	}
 
 	defer interrupts.WaitForGracefulShutdown()
-	pjutil.ServePProf(o.instrumentation.PProfPort)
+	pprof.Instrument(o.instrumentation)
 
 	// setup config agent, pod log clients etc.
-	configAgent := &config.Agent{}
-	if err := configAgent.Start(o.configPath, o.jobConfigPath, spglassConfigDefaulting); err != nil {
+	configAgent, err := o.config.ConfigAgentWithAdditionals(&config.Agent{}, []func(*config.Config) error{spglassConfigDefaulting})
+	if err != nil {
 		logrus.WithError(err).Fatal("Error starting config agent.")
 	}
 	cfg := configAgent.Config
@@ -390,8 +381,8 @@ func main() {
 		// When inrepoconfig is enabled, both the GitHubClient and the gitClient are used to resolve
 		// presubmits dynamically which we need for the PR history page.
 		secretAgent := &secret.Agent{}
-		if o.github.TokenPath != "" {
-			if err := secretAgent.Start([]string{o.github.TokenPath}); err != nil {
+		if o.github.TokenPath != "" || o.github.AppID != "" {
+			if err := secretAgent.Start(nil); err != nil {
 				logrus.WithError(err).Fatal("Error starting secrets agent.")
 			}
 			githubClient, err = o.github.GitHubClient(secretAgent, o.dryRun)
@@ -702,7 +693,7 @@ func initSpyglass(cfg config.Getter, o options, mux *http.ServeMux, ja *jobs.Job
 func initLocalLensHandler(cfg config.Getter, o options, sg *spyglass.Spyglass) error {
 	var localLenses []common.LensWithConfiguration
 	for _, lfc := range cfg().Deck.Spyglass.Lenses {
-		if !strings.HasPrefix(strings.TrimLeft(lfc.RemoteConfig.Endpoint, "http://"), spyglassLocalLensListenerAddr) {
+		if !strings.HasPrefix(strings.TrimPrefix(lfc.RemoteConfig.Endpoint, "http://"), spyglassLocalLensListenerAddr) {
 			continue
 		}
 
@@ -735,16 +726,6 @@ func loadToken(file string) ([]byte, error) {
 		return []byte{}, err
 	}
 	return bytes.TrimSpace(raw), nil
-}
-
-// copy a http.Request
-// see: https://go-review.googlesource.com/c/go/+/36483/3/src/net/http/server.go
-func dupeRequest(original *http.Request) *http.Request {
-	r2 := new(http.Request)
-	*r2 = *original
-	r2.URL = new(url.URL)
-	*r2.URL = *original.URL
-	return r2
 }
 
 func handleCached(next http.Handler) http.Handler {
@@ -949,7 +930,7 @@ func handleRequestJobViews(sg *spyglass.Spyglass, cfg config.Getter, o options, 
 		if err != nil {
 			msg := fmt.Sprintf("error rendering spyglass page: %v", err)
 			if shouldLogHTTPErrors(err) {
-				log.WithError(err).Error(msg)
+				log.WithError(err).Warn(msg)
 			}
 			http.Error(w, msg, httpStatusForError(err))
 			return
@@ -1387,6 +1368,7 @@ func handleProwJob(prowJobClient prowv1.ProwJobInterface, log *logrus.Entry) htt
 			}
 			return
 		}
+		pj.ManagedFields = nil
 		handleSerialize(w, "prowjob", pj, l)
 	}
 }
@@ -1669,7 +1651,8 @@ type httpError struct {
 }
 
 func httpStatusForError(e error) int {
-	if httpErr, ok := e.(httpError); ok {
+	var httpErr httpError
+	if ok := errors.As(e, &httpErr); ok {
 		return httpErr.statusCode
 	}
 	return http.StatusInternalServerError

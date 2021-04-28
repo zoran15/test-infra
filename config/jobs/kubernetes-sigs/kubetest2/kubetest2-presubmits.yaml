@@ -7,9 +7,9 @@ presubmits:
       preset-dind-enabled: "true"
     spec:
       containers:
-      - image: gcr.io/k8s-testimages/krte:v20210129-3799a64-master
+      - image: gcr.io/k8s-testimages/kubekins-e2e:v20210418-e5f251e-master
         command:
-        - wrapper.sh
+        - runner.sh
         args:
         - make
         - verify
@@ -22,9 +22,9 @@ presubmits:
       preset-dind-enabled: "true"
     spec:
       containers:
-      - image: gcr.io/k8s-testimages/krte:v20210129-3799a64-master
+      - image: gcr.io/k8s-testimages/kubekins-e2e:v20210418-e5f251e-master
         command:
-        - wrapper.sh
+        - runner.sh
         args:
         - make
         - build-all

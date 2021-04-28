@@ -23,6 +23,8 @@ import (
 	"sync"
 	"time"
 
+	"k8s.io/apimachinery/pkg/util/sets"
+
 	"k8s.io/test-infra/pkg/genyaml"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -297,9 +299,9 @@ func (pa *ConfigAgent) Start(path string, checkUnknownPlugins bool) error {
 	if err := pa.Load(path, checkUnknownPlugins); err != nil {
 		return err
 	}
-	ticker := time.Tick(1 * time.Minute)
+	ticker := time.NewTicker(time.Minute)
 	go func() {
-		for range ticker {
+		for range ticker.C {
 			if err := pa.Load(path, checkUnknownPlugins); err != nil {
 				logrus.WithField("path", path).WithError(err).Error("Error loading plugin config.")
 			}
@@ -431,8 +433,10 @@ func (pa *ConfigAgent) getPlugins(owner, repo string) []string {
 	var plugins []string
 
 	fullName := fmt.Sprintf("%s/%s", owner, repo)
-	plugins = append(plugins, pa.configuration.Plugins[owner]...)
-	plugins = append(plugins, pa.configuration.Plugins[fullName]...)
+	if !sets.NewString(pa.configuration.Plugins[owner].ExcludedRepos...).Has(repo) {
+		plugins = append(plugins, pa.configuration.Plugins[owner].Plugins...)
+	}
+	plugins = append(plugins, pa.configuration.Plugins[fullName].Plugins...)
 
 	return plugins
 }

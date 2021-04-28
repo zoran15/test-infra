@@ -25,7 +25,7 @@ import (
 
 	githubql "github.com/shurcooL/githubv4"
 	"github.com/sirupsen/logrus"
-
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/test-infra/prow/config"
 	"k8s.io/test-infra/prow/github"
 	"k8s.io/test-infra/prow/labels"
@@ -49,7 +49,7 @@ type githubClient interface {
 	RemoveLabel(org, repo string, number int, label string) error
 	IsMergeable(org, repo string, number int, sha string) (bool, error)
 	DeleteStaleComments(org, repo string, number int, comments []github.IssueComment, isStale func(github.IssueComment) bool) error
-	Query(context.Context, interface{}, map[string]interface{}) error
+	QueryWithGitHubAppsSupport(ctx context.Context, q interface{}, vars map[string]interface{}, org string) error
 	GetPullRequest(org, repo string, number int) (*github.PullRequest, error)
 }
 
@@ -92,7 +92,7 @@ func HandleIssueCommentEvent(log *logrus.Entry, ghc githubClient, ice *github.Is
 // label needs to be added or removed. It depends on GitHub mergeability check
 // to decide the need for a rebase.
 func handle(log *logrus.Entry, ghc githubClient, pr *github.PullRequest) error {
-	if pr.Merged {
+	if pr.State != github.PullRequestStateOpen {
 		return nil
 	}
 	// Before checking mergeability wait a few seconds to give github a chance to calculate it.
@@ -103,6 +103,12 @@ func handle(log *logrus.Entry, ghc githubClient, pr *github.PullRequest) error {
 	repo := pr.Base.Repo.Name
 	number := pr.Number
 	sha := pr.Head.SHA
+	*log = *log.WithFields(logrus.Fields{
+		github.OrgLogField:  org,
+		github.RepoLogField: repo,
+		github.PrLogField:   number,
+		"head-sha":          sha,
+	})
 
 	mergeable, err := ghc.IsMergeable(org, repo, number, sha)
 	if err != nil {
@@ -117,50 +123,61 @@ func handle(log *logrus.Entry, ghc githubClient, pr *github.PullRequest) error {
 	return takeAction(log, ghc, org, repo, number, pr.User.Login, hasLabel, mergeable)
 }
 
+const searchQueryPrefix = "archived:false is:pr is:open"
+
 // HandleAll checks all orgs and repos that enabled this plugin for open PRs to
 // determine if the "needs-rebase" label needs to be added or removed. It
 // depends on GitHub's mergeability check to decide the need for a rebase.
-func HandleAll(log *logrus.Entry, ghc githubClient, config *plugins.Configuration) error {
+func HandleAll(log *logrus.Entry, ghc githubClient, config *plugins.Configuration, usesAppsAuth bool) error {
 	log.Info("Checking all PRs.")
 	orgs, repos := config.EnabledReposForExternalPlugin(PluginName)
 	if len(orgs) == 0 && len(repos) == 0 {
 		log.Warnf("No repos have been configured for the %s plugin", PluginName)
 		return nil
 	}
-	var buf bytes.Buffer
-	fmt.Fprint(&buf, "archived:false is:pr is:open")
-	for _, org := range orgs {
-		fmt.Fprintf(&buf, " org:\"%s\"", org)
+
+	var prs []pullRequest
+	var errs []error
+	for org, queries := range constructQueries(log, time.Now(), orgs, repos, usesAppsAuth) {
+		// Do _not_ parallelize this. It will trigger GitHubs abuse detection and we don't really care anyways except
+		// when developing.
+		for _, query := range queries {
+			found, err := search(context.Background(), log, ghc, query, org)
+			prs = append(prs, found...)
+			errs = append(errs, err)
+		}
 	}
-	for _, repo := range repos {
-		fmt.Fprintf(&buf, " repo:\"%s\"", repo)
+	if err := utilerrors.NewAggregate(errs); err != nil {
+		if len(prs) == 0 {
+			return err
+		}
+		log.WithError(err).Error("Encountered errors when querying GitHub but will process received results anyways")
 	}
-	prs, err := search(context.Background(), log, ghc, buf.String())
-	if err != nil {
-		return err
-	}
-	log.Infof("Considering %d PRs.", len(prs))
+	log.WithField("prs_found_count", len(prs)).Debug("Processing all found PRs")
 
 	for _, pr := range prs {
-		// Skip PRs that are calculating mergeability. They will be updated by event or next loop.
-		if pr.Mergeable == githubql.MergeableStateUnknown {
+		// Skip PRs that are calculating mergeability or are not open. They will be updated by event or next loop.
+		if pr.Mergeable == githubql.MergeableStateUnknown || pr.State != githubql.PullRequestStateOpen {
 			continue
 		}
 		org := string(pr.Repository.Owner.Login)
 		repo := string(pr.Repository.Name)
 		num := int(pr.Number)
-		l := log.WithFields(logrus.Fields{
-			"org":  org,
-			"repo": repo,
-			"pr":   num,
-		})
-		hasLabel := false
+		var hasLabel bool
 		for _, label := range pr.Labels.Nodes {
 			if label.Name == labels.NeedsRebase {
 				hasLabel = true
 				break
 			}
 		}
+		l := log.WithFields(logrus.Fields{
+			"org":       org,
+			"repo":      repo,
+			"pr":        num,
+			"mergeable": pr.Mergeable,
+			"has_label": hasLabel,
+		})
+		l.Debug("Processing PR")
 		err := takeAction(
 			l,
 			ghc,
@@ -209,7 +226,7 @@ func shouldPrune(isBot func(string) bool) func(github.IssueComment) bool {
 	}
 }
 
-func search(ctx context.Context, log *logrus.Entry, ghc githubClient, q string) ([]pullRequest, error) {
+func search(ctx context.Context, log *logrus.Entry, ghc githubClient, q, org string) ([]pullRequest, error) {
 	var ret []pullRequest
 	vars := map[string]interface{}{
 		"query":        githubql.String(q),
@@ -217,9 +234,12 @@ func search(ctx context.Context, log *logrus.Entry, ghc githubClient, q string) 
 	}
 	var totalCost int
 	var remaining int
+	requestStart := time.Now()
+	var pageCount int
 	for {
+		pageCount++
 		sq := searchQuery{}
-		if err := ghc.Query(ctx, &sq, vars); err != nil {
+		if err := ghc.QueryWithGitHubAppsSupport(ctx, &sq, vars, org); err != nil {
 			return nil, err
 		}
 		totalCost += int(sq.RateLimit.Cost)
@@ -232,7 +252,20 @@ func search(ctx context.Context, log *logrus.Entry, ghc githubClient, q string) 
 		}
 		vars["searchCursor"] = githubql.NewString(sq.Search.PageInfo.EndCursor)
 	}
-	log.Infof("Search for query \"%s\" cost %d point(s). %d remaining.", q, totalCost, remaining)
+	log = log.WithFields(logrus.Fields{
+		"query":          q,
+		"duration":       time.Since(requestStart).String(),
+		"pr_found_count": len(ret),
+		"search_pages":   pageCount,
+		"cost":           totalCost,
+		"remaining":      remaining,
+	})
+	log.Debug("Finished query")
+
+	// https://github.community/t/graphql-github-api-how-to-get-more-than-1000-pull-requests/13838/10
+	if len(ret) == 1000 {
+		log.Warning("Query returned 1k PRs, which is the max number of results per query allowed by GitHub. This indicates that we were not able to process all PRs.")
+	}
 	return ret, nil
 }
 
@@ -254,6 +287,7 @@ type pullRequest struct {
 		}
 	} `graphql:"labels(first:100)"`
 	Mergeable githubql.MergeableState
+	State     githubql.PullRequestState
 }
 
 // See: https://developer.github.com/v4/query/.
@@ -271,4 +305,58 @@ type searchQuery struct {
 			PullRequest pullRequest `graphql:"... on PullRequest"`
 		}
 	} `graphql:"search(type: ISSUE, first: 100, after: $searchCursor, query: $query)"`
+}
+
+// constructQueries constructs the v4 queries for the peridic scan.
+// It returns a map[org][]query.
+func constructQueries(log *logrus.Entry, now time.Time, orgs, repos []string, usesGitHubAppsAuth bool) map[string][]string {
+	result := map[string][]string{}
+
+	// GitHub hard caps queries at 1k results, so always do one query per org and one for
+	// all repos. Ref: https://github.community/t/graphql-github-api-how-to-get-more-than-1000-pull-requests/13838/11
+	for _, org := range orgs {
+		// https://img.17qq.com/images/crqhcuueqhx.jpeg
+		if org == "kubernetes" {
+			result[org] = append(result[org], searchQueryPrefix+` org:"kubernetes" -repo:"kubernetes/kubernetes"`)
+
+			// Sharding by creation time > 2 months ago gives us around 50% of PRs per query (585 for the newer ones, 538 for the older ones when testing)
+			twoMonthsAgoISO8601 := now.Add(-2 * 30 * 24 * time.Hour).Format("2006-01-02")
+			result[org] = append(result[org], searchQueryPrefix+` repo:"kubernetes/kubernetes" created:>=`+twoMonthsAgoISO8601)
+			result[org] = append(result[org], searchQueryPrefix+` repo:"kubernetes/kubernetes" created:<`+twoMonthsAgoISO8601)
+		} else {
+			result[org] = append(result[org], searchQueryPrefix+` org:"`+org+`"`)
+		}
+	}
+
+	reposQueries := map[string]*bytes.Buffer{}
+	for _, repo := range repos {
+		slashSplit := strings.Split(repo, "/")
+		if n := len(slashSplit); n != 2 {
+			log.WithField("repo", repo).Warn("Found repo that was not in org/repo format, ignoring...")
+			continue
+		}
+		org := slashSplit[0]
+		if _, hasOrgQuery := result[org]; hasOrgQuery {
+			log.WithField("repo", repo).Warn("Plugin was enabled for repo even though it is already enabled for the org, ignoring...")
+			continue
+		}
+		var b *bytes.Buffer
+		if usesGitHubAppsAuth {
+			if reposQueries[org] == nil {
+				reposQueries[org] = bytes.NewBufferString(searchQueryPrefix)
+			}
+			b = reposQueries[org]
+		} else {
+			if reposQueries[""] == nil {
+				reposQueries[""] = bytes.NewBufferString(searchQueryPrefix)
+			}
+			b = reposQueries[""]
+		}
+		fmt.Fprintf(b, " repo:\"%s\"", repo)
+	}
+	for org, repoQuery := range reposQueries {
+		result[org] = append(result[org], repoQuery.String())
+	}
+
+	return result
 }

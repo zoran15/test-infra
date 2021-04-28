@@ -52,6 +52,11 @@ import (
 
 const ControllerName = "plank"
 
+// PodStatus constants
+const (
+	Evicted = "Evicted"
+)
+
 func Add(
 	mgr controllerruntime.Manager,
 	buildMgrs map[string]controllerruntime.Manager,
@@ -604,6 +609,8 @@ func (r *reconciler) startPod(ctx context.Context, pj *prowv1.ProwJob) (string, 
 		return "", "", err
 	}
 	pod.Namespace = r.config().PodNamespace
+	// Add prow version as a label for better debugging prowjobs.
+	pod.ObjectMeta.Labels[kube.PlankVersionLabel] = version.Version
 
 	client, ok := r.buildClients[pj.ClusterAlias()]
 	if !ok {
@@ -618,7 +625,7 @@ func (r *reconciler) startPod(ctx context.Context, pj *prowv1.ProwJob) (string, 
 	// We must block until we see the pod, otherwise a new reconciliation may be triggered that tries to create
 	// the pod because its not in the cache yet, errors with IsAlreadyExists and sets the prowjob to failed
 	podName := types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}
-	if err := wait.Poll(100*time.Millisecond, 2*time.Second, func() (bool, error) {
+	if err := wait.Poll(100*time.Millisecond, 10*time.Second, func() (bool, error) {
 		if err := client.Get(ctx, podName, pod); err != nil {
 			if kerrors.IsNotFound(err) {
 				return false, nil
@@ -802,4 +809,30 @@ func didPodSucceed(p *corev1.Pod) bool {
 	}
 
 	return true
+}
+
+func getPodBuildID(pod *corev1.Pod) string {
+	if buildID, ok := pod.ObjectMeta.Labels[kube.ProwBuildIDLabel]; ok && buildID != "" {
+		return buildID
+	}
+
+	// For backwards compatibility: existing pods may not have the buildID label.
+	for _, env := range pod.Spec.Containers[0].Env {
+		if env.Name == "BUILD_ID" {
+			return env.Value
+		}
+	}
+
+	logrus.Warningf("BUILD_ID was not found in pod %q: streaming logs from deck will not work", pod.ObjectMeta.Name)
+	return ""
+}
+
+// isRequestError extracts an HTTP status code from a kerrors.APIStatus and
+// returns true if it is a 4xx error.
+func isRequestError(err error) bool {
+	code := 500 // This is what kerrors.ReasonForError() defaults to.
+	if statusErr, ok := err.(kerrors.APIStatus); ok {
+		code = int(statusErr.Status().Code)
+	}
+	return 400 <= code && code < 500
 }

@@ -8,7 +8,7 @@ presubmits:
       preset-dind-enabled: "true"
     spec:
       containers:
-      - image: gcr.io/k8s-testimages/bootstrap:v20210130-12516b2
+      - image: gcr.io/k8s-testimages/bootstrap:v20210402-64f9afb
         command:
         - runner.sh
         args:
@@ -30,13 +30,13 @@ presubmits:
 
 periodics:
 - interval: 1h
-  name: ci-kubernetes-build
+  name: ci-kubernetes-build-deprecated
   labels:
     preset-service-account: "true"
     preset-dind-enabled: "true"
   spec:
     containers:
-    - image: gcr.io/k8s-testimages/bootstrap:v20210130-12516b2
+    - image: gcr.io/k8s-testimages/bootstrap:v20210402-64f9afb
       args:
       - --repo=k8s.io/kubernetes
       - --repo=k8s.io/release
@@ -63,11 +63,11 @@ periodics:
   annotations:
     fork-per-release: "true"
     fork-per-release-replacements: "k8s-master -> k8s-beta"
-    testgrid-dashboards: sig-release-master-blocking
-    testgrid-tab-name: build-master
+    testgrid-dashboards: sig-release-master-informing
+    testgrid-tab-name: build-master-deprecated
     testgrid-alert-email: release-managers+alerts@kubernetes.io, release-team@kubernetes.io
 
-- name: ci-kubernetes-build-canary
+- name: ci-kubernetes-build
   interval: 1h
   cluster: k8s-infra-prow-build
   decorate: true
@@ -80,7 +80,8 @@ periodics:
     preset-dind-enabled: "true"
   spec:
     containers:
-    - image: gcr.io/k8s-staging-releng/k8s-ci-builder:v20201128-v0.6.0-6-g6313f696-default
+    - image: gcr.io/k8s-staging-releng/k8s-ci-builder:latest-default
+      imagePullPolicy: Always
       command:
       - wrapper.sh
       - /krel
@@ -104,8 +105,10 @@ periodics:
     github_team_ids:
       - 2241179 # release-managers
   annotations:
-    testgrid-dashboards: sig-release-releng-informing, sig-release-master-informing, sig-testing-canaries
-    testgrid-tab-name: build-master-canary
+    fork-per-release: "true"
+    fork-per-release-replacements: "k8s-master -> k8s-beta, latest-default -> latest-{{.Version}}"
+    testgrid-dashboards: sig-release-master-blocking, sig-release-releng-blocking
+    testgrid-tab-name: build-master
     testgrid-alert-email: release-managers+alerts@kubernetes.io, release-team@kubernetes.io
 
 - interval: 5m
@@ -116,7 +119,7 @@ periodics:
     preset-dind-enabled: "true"
   spec:
     containers:
-    - image: gcr.io/k8s-testimages/bootstrap:v20210130-12516b2
+    - image: gcr.io/k8s-testimages/bootstrap:v20210402-64f9afb
       args:
       - --repo=k8s.io/kubernetes
       - --repo=k8s.io/release

@@ -5,13 +5,12 @@ postsubmits:
       annotations:
         testgrid-dashboards: wg-multi-tenancy-externalip
       decorate: true
-      always_run: true
       branches:
         - ^master$
       spec:
         serviceAccountName: gcb-builder
         containers:
-          - image: gcr.io/k8s-testimages/image-builder:v20200901-ab141a0
+          - image: gcr.io/k8s-testimages/image-builder:v20210302-aa40187
             command:
               - /run.sh
             args:

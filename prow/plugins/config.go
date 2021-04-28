@@ -26,6 +26,8 @@ import (
 	"strings"
 	"time"
 
+	"sigs.k8s.io/yaml"
+
 	"github.com/sirupsen/logrus"
 
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -47,10 +49,10 @@ const (
 type Configuration struct {
 	// Plugins is a map of repositories (eg "k/k") to lists of
 	// plugin names.
-	// You can find a comprehensive list of the default avaulable plugins here
+	// You can find a comprehensive list of the default available plugins here
 	// https://github.com/kubernetes/test-infra/tree/master/prow/plugins
 	// note that you're also able to add external plugins.
-	Plugins map[string][]string `json:"plugins,omitempty"`
+	Plugins Plugins `json:"plugins,omitempty"`
 
 	// ExternalPlugins is a map of repositories (eg "k/k") to lists of
 	// external plugins.
@@ -73,6 +75,7 @@ type Configuration struct {
 	Heart                Heart                        `json:"heart,omitempty"`
 	Label                Label                        `json:"label,omitempty"`
 	Lgtm                 []Lgtm                       `json:"lgtm,omitempty"`
+	Jira                 *Jira                        `json:"jira,omitempty"`
 	MilestoneApplier     map[string]BranchToMilestone `json:"milestone_applier,omitempty"`
 	RepoMilestone        map[string]Milestone         `json:"repo_milestone,omitempty"`
 	Project              ProjectConfig                `json:"project_config,omitempty"`
@@ -106,6 +109,13 @@ type Golint struct {
 	// in (0,1] over which problems will be printed. Defaults to
 	// 0.8, as does the `go lint` tool.
 	MinimumConfidence *float64 `json:"minimum_confidence,omitempty"`
+}
+
+type Plugins map[string]OrgPlugins
+
+type OrgPlugins struct {
+	ExcludedRepos []string `json:"excluded_repos,omitempty"`
+	Plugins       []string `json:"plugins,omitempty"`
 }
 
 // ExternalPlugin holds configuration for registering an external
@@ -164,9 +174,13 @@ type Owners struct {
 	// control in the provided repos.
 	SkipCollaborators []string `json:"skip_collaborators,omitempty"`
 
-	// LabelsBlackList holds a list of labels that should not be present in any
+	// LabelsDenyList holds a list of labels that should not be present in any
 	// OWNERS file, preventing their automatic addition by the owners-label plugin.
 	// This check is performed by the verify-owners plugin.
+	LabelsDenyList []string `json:"labels_denylist,omitempty"`
+
+	// LabelsBlackList will be removed after October 2021, use
+	// labels_denylist instead
 	LabelsBlackList []string `json:"labels_blacklist,omitempty"`
 
 	// Filenames allows configuring repos to use a separate set of filenames for
@@ -254,6 +268,11 @@ type Size struct {
 type Blockade struct {
 	// Repos are either of the form org/repos or just org.
 	Repos []string `json:"repos,omitempty"`
+	// BranchRegexp is the regular expression for branches that the the blockade applies to.
+	// If BranchRegexp is not specified, the blockade applies to all branches by default.
+	// Compiles into BranchRe during config load.
+	BranchRegexp *string        `json:"branchregexp,omitempty"`
+	BranchRe     *regexp.Regexp `json:"-"`
 	// BlockRegexps are regular expressions matching the file paths to block.
 	BlockRegexps []string `json:"blockregexps,omitempty"`
 	// ExceptionRegexps are regular expressions matching the file paths that are exceptions to the BlockRegexps.
@@ -326,6 +345,14 @@ type Lgtm struct {
 	// StickyLgtmTeam specifies the GitHub team whose members are trusted with sticky LGTM,
 	// which eliminates the need to re-lgtm minor fixes/updates.
 	StickyLgtmTeam string `json:"trusted_team_for_sticky_lgtm,omitempty"`
+}
+
+// Jira holds the config for the jira plugin.
+type Jira struct {
+	// DisabledJiraProjects are projects for which we will never try to create a link,
+	// for example including `enterprise` here would disable linking for all issues
+	// that start with `enterprise-` like `enterprise-4.` Matching is case-insenitive.
+	DisabledJiraProjects []string `json:"disabled_jira_projects,omitempty"`
 }
 
 // Cat contains the configuration for the cat plugin.
@@ -413,7 +440,9 @@ type ConfigMapSpec struct {
 	// Name of ConfigMap
 	Name string `json:"name"`
 	// Key is the key in the ConfigMap to update with the file contents.
-	// If no explicit key is given, the basename of the file will be used.
+	// If no explicit key is given, the basename of the file will be used unless
+	// use_full_path_as_key: true is set, in which case the full filepath relative
+	// to the repository root will be used, replacing slashes with dashes.
 	Key string `json:"key,omitempty"`
 	// GZIP toggles whether the key's data should be GZIP'd before being stored
 	// If set to false and the global GZIP option is enabled, this file will
@@ -424,6 +453,10 @@ type ConfigMapSpec struct {
 	Clusters map[string][]string `json:"clusters"`
 	// ClusterGroup is a list of named cluster_groups to target. Mutually exclusive with clusters.
 	ClusterGroups []string `json:"cluster_groups,omitempty"`
+	// UseFullPathAsKey controls if the full path of the original file relative to the
+	// repository root should be used as the configmap key. Slashes will be replaced by
+	// dashes. Using this avoids the need for unique file names in the original repo.
+	UseFullPathAsKey bool `json:"use_full_path_as_key,omitempty"`
 }
 
 // A ClusterGroup is a list of clusters with namespaces
@@ -802,11 +835,39 @@ func (c *Configuration) DcoFor(org, repo string) *Dco {
 	return &Dco{}
 }
 
+func OldToNewPlugins(oldPlugins map[string][]string) Plugins {
+	newPlugins := make(Plugins)
+	for repo, plugins := range oldPlugins {
+		newPlugins[repo] = OrgPlugins{
+			Plugins: plugins,
+		}
+	}
+	return newPlugins
+}
+
+type pluginsWithoutUnmarshaler Plugins
+
+var warnTriggerDeprecatedConfig time.Time
+
+func (p *Plugins) UnmarshalJSON(d []byte) error {
+	var oldPlugins map[string][]string
+	if err := yaml.Unmarshal(d, &oldPlugins); err == nil {
+		logrusutil.ThrottledWarnf(&warnTriggerDeprecatedConfig, time.Hour, "plugins declaration uses a deprecated config style, see https://github.com/kubernetes/test-infra/issues/20631#issuecomment-787693609 for a migration guide")
+		*p = OldToNewPlugins(oldPlugins)
+		return nil
+	}
+	var target pluginsWithoutUnmarshaler
+	err := yaml.Unmarshal(d, &target)
+	*p = Plugins(target)
+	return err
+}
+
 // EnabledReposForPlugin returns the orgs and repos that have enabled the passed plugin.
-func (c *Configuration) EnabledReposForPlugin(plugin string) (orgs, repos []string) {
+func (c *Configuration) EnabledReposForPlugin(plugin string) (orgs, repos []string, orgExceptions map[string]sets.String) {
+	orgExceptions = make(map[string]sets.String)
 	for repo, plugins := range c.Plugins {
 		found := false
-		for _, candidate := range plugins {
+		for _, candidate := range plugins.Plugins {
 			if candidate == plugin {
 				found = true
 				break
@@ -817,8 +878,17 @@ func (c *Configuration) EnabledReposForPlugin(plugin string) (orgs, repos []stri
 				repos = append(repos, repo)
 			} else {
 				orgs = append(orgs, repo)
+				orgExceptions[repo] = sets.NewString()
+				for _, excludedRepo := range plugins.ExcludedRepos {
+					orgExceptions[repo].Insert(fmt.Sprintf("%s/%s", repo, excludedRepo))
+				}
 			}
 		}
+	}
+	// <plugin> plugin might be declared in both org and org/repo
+	// in that case, remove repo from org's orgExceptions despite the excluded_repo in org
+	for _, repo := range repos {
+		orgExceptions[strings.Split(repo, "/")[0]].Delete(repo)
 	}
 	return
 }
@@ -889,8 +959,12 @@ func (c *Configuration) setDefaults() {
 	if c.SigMention.Regexp == "" {
 		c.SigMention.Regexp = `(?m)@kubernetes/sig-([\w-]*)-(misc|test-failures|bugs|feature-requests|proposals|pr-reviews|api-reviews)`
 	}
-	if c.Owners.LabelsBlackList == nil {
-		c.Owners.LabelsBlackList = []string{labels.Approved, labels.LGTM}
+	if c.Owners.LabelsDenyList == nil {
+		if c.Owners.LabelsBlackList != nil {
+			c.Owners.LabelsDenyList = c.Owners.LabelsBlackList
+		} else {
+			c.Owners.LabelsDenyList = []string{labels.Approved, labels.LGTM}
+		}
 	}
 	for _, milestone := range c.RepoMilestone {
 		if milestone.MaintainersFriendlyName == "" {
@@ -914,12 +988,12 @@ func (c *Configuration) setDefaults() {
 // validatePluginsDupes will return an error if there are duplicated plugins.
 // It is sometimes a sign of misconfiguration and is always useless for a
 // plugin to be specified at both the org and repo levels.
-func validatePluginsDupes(plugins map[string][]string) error {
+func validatePluginsDupes(plugins Plugins) error {
 	var errors []error
 	for repo, repoConfig := range plugins {
 		if strings.Contains(repo, "/") {
 			org := strings.Split(repo, "/")[0]
-			if dupes := findDuplicatedPluginConfig(repoConfig, plugins[org]); len(dupes) > 0 {
+			if dupes := findDuplicatedPluginConfig(repoConfig.Plugins, plugins[org].Plugins); len(dupes) > 0 {
 				errors = append(errors, fmt.Errorf("plugins %v are duplicated for %s and %s", dupes, repo, org))
 			}
 		}
@@ -932,7 +1006,7 @@ func validatePluginsDupes(plugins map[string][]string) error {
 func (c *Configuration) ValidatePluginsUnknown() error {
 	var errors []error
 	for _, configuration := range c.Plugins {
-		for _, plugin := range configuration {
+		for _, plugin := range configuration.Plugins {
 			if _, ok := pluginHelp[plugin]; !ok {
 				errors = append(errors, fmt.Errorf("unknown plugin: %s", plugin))
 			}
@@ -1108,6 +1182,17 @@ func compileRegexpsAndDurations(pc *Configuration) error {
 	}
 	pc.CherryPickUnapproved.BranchRe = branchRe
 
+	for i := range pc.Blockades {
+		if pc.Blockades[i].BranchRegexp == nil {
+			continue
+		}
+		branchRe, err := regexp.Compile(*pc.Blockades[i].BranchRegexp)
+		if err != nil {
+			return fmt.Errorf("failed to compile blockade branchregexp: %q, error: %v", *pc.Blockades[i].BranchRegexp, err)
+		}
+		pc.Blockades[i].BranchRe = branchRe
+	}
+
 	commentRe, err := regexp.Compile(pc.Heart.CommentRegexp)
 	if err != nil {
 		return err
@@ -1137,6 +1222,9 @@ func (c *Configuration) Validate() error {
 		logrus.Warn("no plugins specified-- check syntax?")
 	}
 
+	if c.Owners.LabelsBlackList != nil && c.Owners.LabelsDenyList != nil {
+		return errors.New("labels_blacklist and labels_denylist cannot be both supplied")
+	}
 	// Defaulting should run before validation.
 	c.setDefaults()
 	// Regexp compilation should run after defaulting, but before validation.

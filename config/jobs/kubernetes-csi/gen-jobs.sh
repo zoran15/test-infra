@@ -38,16 +38,16 @@ deployment_versions="
 "
 
 # The experimental version for which jobs are optional.
-experimental_k8s_version="1.20"
+experimental_k8s_version=""
 
 # The latest stable Kubernetes version for testing alpha jobs
 latest_stable_k8s_version="1.20"
 
 # Tag of the hostpath driver we should use for sidecar pull jobs
-hostpath_driver_version="v1.5.0"
+hostpath_driver_version="v1.6.0"
 
 # We need this image because it has Docker in Docker and go.
-dind_image="gcr.io/k8s-testimages/kubekins-e2e:v20210113-cc576af-master"
+dind_image="gcr.io/k8s-testimages/kubekins-e2e:v20210418-e5f251e-master"
 
 # All kubernetes-csi repos which are part of the hostpath driver example.
 # For these repos we generate the full test matrix. For each entry here
@@ -61,6 +61,16 @@ external-resizer
 external-snapshotter
 livenessprobe
 node-driver-registrar
+"
+
+# All kubernetes-csi repos for which want to define pull tests for
+# the csi-release-tools repo. Ideally, this list should represent
+# different ways of using csi-release-tools (for example, single image
+# vs. multiple images per repo).
+csi_release_tools_repos="
+csi-test
+external-provisioner
+external-snapshotter
 "
 
 # kubernetes-csi repos which only need to be tested against at most a
@@ -265,6 +275,34 @@ pull_alwaysrun() {
     fi
 }
 
+# version_gt returns true if arg1 is greater than arg2.
+#
+# This function expects versions to be one of the following formats:
+#   X.Y.Z, release-X.Y.Z, vX.Y.Z
+#
+#   where X,Y, and Z are any number.
+#
+# Partial versions (1.2, release-1.2) work as well.
+# The follow substrings are stripped before version comparison:
+#   - "v"
+#   - "release-"
+#
+# Usage:
+# version_gt release-1.3 v1.2.0  (returns true)
+# version_gt v1.1.1 v1.2.0  (returns false)
+# version_gt 1.1.1 v1.2.0  (returns false)
+# version_gt 1.3.1 v1.2.0  (returns true)
+# version_gt 1.1.1 release-1.2.0  (returns false)
+# version_gt 1.2.0 1.2.2  (returns false)
+function version_gt() {
+    versions=$(for ver in "$@"; do ver=${ver#release-}; ver=${ver#kubernetes-}; echo ${ver#v}; done)
+    greaterVersion=${1#"release-"};
+    greaterVersion=${greaterVersion#"kubernetes-"};
+    greaterVersion=${greaterVersion#"v"};
+    test "$(printf '%s' "$versions" | sort -V | head -n 1)" != "$greaterVersion"
+}
+
+
 snapshotter_version() {
     local kubernetes="$1"
     local canary="$2"
@@ -280,17 +318,24 @@ snapshotter_version() {
         #
         # Additional jobs could be created to cover version
         # skew, if desired.
-        case "$kubernetes" in
-            1.20)
-                echo '"v4.0.0"'
-                ;;
-            *)
-                echo '"v3.0.3"'
-                ;;
-        esac
+        if [ "$kubernetes" == "latest" ] || [ "$kubernetes" == "master" ] || version_gt "$kubernetes" 1.19; then
+            echo '"v4.0.0"'
+        else
+            echo '"v3.0.3"'
+        fi
     fi
 }
 
+use_bazel() {
+    local kubernetes="$1"
+
+    # Kubernetes 1.21 removed support for building with Bazel.
+    if version_gt "$kubernetes" "1.21"; then
+        echo "false"
+    else
+        echo "true"
+    fi
+}
 
 for repo in $hostpath_example_repos; do
     mkdir -p "$base/$repo"
@@ -343,6 +388,8 @@ EOF
         # by periodic jobs (see https://k8s-testgrid.appspot.com/sig-storage-csi-ci#Summary).
         - name: CSI_PROW_KUBERNETES_VERSION
           value: "$kubernetes.0"
+        - name: CSI_PROW_USE_BAZEL
+          value: "$(use_bazel "$kubernetes")"
         - name: CSI_PROW_KUBERNETES_DEPLOYMENT
           value: "$deployment"
         - name: CSI_PROW_DRIVER_VERSION
@@ -390,6 +437,8 @@ EOF
         env:
         - name: CSI_PROW_KUBERNETES_VERSION
           value: "latest"
+        - name: CSI_PROW_USE_BAZEL
+          value: "$(use_bazel "latest")"
         - name: CSI_PROW_DRIVER_VERSION
           value: "$hostpath_driver_version"
         - name: CSI_SNAPSHOTTER_VERSION
@@ -583,6 +632,8 @@ for tests in non-alpha alpha; do
       env:
       - name: CSI_PROW_KUBERNETES_VERSION
         value: "$actual"
+      - name: CSI_PROW_USE_BAZEL
+        value: "$(use_bazel "$actual")"
       - name: CSI_SNAPSHOTTER_VERSION
         value: $(snapshotter_version "$actual" "")
       - name: CSI_PROW_BUILD_JOB
@@ -640,6 +691,8 @@ for kubernetes in $k8s_versions master; do
       env:
       - name: CSI_PROW_KUBERNETES_VERSION
         value: "$actual"
+      - name: CSI_PROW_USE_BAZEL
+        value: "$(use_bazel "$actual")"
       - name: CSI_PROW_BUILD_JOB
         value: "false"
       # Replace images....
@@ -660,4 +713,55 @@ for kubernetes in $k8s_versions master; do
 $(resources_for_kubernetes "$actual")
 EOF
     done
+done
+
+for repo in $csi_release_tools_repos; do
+    cat >>"$base/csi-release-tools/csi-release-tools-config.yaml" <<EOF
+  - name: $(job_name "pull" "release-tools" "$repo" "" "")
+    always_run: true
+    optional: false # cannot be required because updates in csi-release-tools may include breaking changes
+    decorate: true
+    skip_report: false
+    extra_refs:
+    - org: kubernetes-csi
+      repo: $repo
+      base_ref: master
+      workdir: false
+      # Checked out in /home/prow/go/src/github.com/kubernetes-csi/$repo
+    labels:
+      preset-service-account: "true"
+      preset-dind-enabled: "true"
+      preset-kind-volume-mounts: "true"
+    annotations:
+      testgrid-dashboards: sig-storage-csi-other
+      testgrid-tab-name: pull-csi-release-tools-in-$repo
+      description: Kubernetes-CSI pull job in repo csi-release-tools for $repo, using deployment $latest_stable_k8s_version on Kubernetes $latest_stable_k8s_version
+    spec:
+      containers:
+      # We need this image because it has Docker in Docker and go.
+      - image: ${dind_image}
+        command:
+        - runner.sh
+        args:
+        - ./pull-test.sh # provided by csi-release-tools
+        env:
+        - name: CSI_PROW_KUBERNETES_VERSION
+          value: "$latest_stable_k8s_version.0"
+        - name: CSI_PROW_USE_BAZEL
+          value: "$(use_bazel "$latest_stable_k8s_version")"
+        - name: CSI_PROW_KUBERNETES_DEPLOYMENT
+          value: "$latest_stable_k8s_version"
+        - name: CSI_PROW_DRIVER_VERSION
+          value: "$hostpath_driver_version"
+        - name: CSI_SNAPSHOTTER_VERSION
+          value: $(snapshotter_version "$latest_stable_k8s_version" "")
+        - name: CSI_PROW_TESTS
+          value: "unit sanity parallel"
+        - name: PULL_TEST_REPO_DIR
+          value: /home/prow/go/src/github.com/kubernetes-csi/$repo
+        # docker-in-docker needs privileged mode
+        securityContext:
+          privileged: true
+$(resources_for_kubernetes "$latest_stable_k8s_version")
+EOF
 done

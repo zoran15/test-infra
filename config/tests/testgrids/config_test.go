@@ -97,7 +97,7 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
-	prowConfig, err = prow_config.Load(*prowPath, *jobPath)
+	prowConfig, err = prow_config.Load(*prowPath, *jobPath, nil, "")
 	if err != nil {
 		fmt.Printf("Could not load prow configs: %v\n", err)
 		os.Exit(1)
@@ -416,7 +416,7 @@ func TestPresubmitsKubernetesDashboards(t *testing.T) {
 		}
 	}
 	if dashboard == nil {
-		t.Errorf("Missing dashboard: %s", dash)
+		t.Fatalf("Missing dashboard: %s", dash)
 	}
 	testgroups := make(map[string]bool)
 	for _, tab := range dashboard.DashboardTab {

@@ -40,21 +40,23 @@ const (
 
 // FakeClient is like client, but fake.
 type FakeClient struct {
-	Issues              map[int]*github.Issue
-	IssueID             int
-	OrgMembers          map[string][]string
-	Collaborators       []string
-	IssueComments       map[int][]github.IssueComment
-	IssueCommentID      int
-	PullRequests        map[int]*github.PullRequest
-	PullRequestChanges  map[int][]github.PullRequestChange
-	PullRequestComments map[int][]github.ReviewComment
-	ReviewID            int
-	Reviews             map[int][]github.Review
-	CombinedStatuses    map[string]*github.CombinedStatus
-	CreatedStatuses     map[string][]github.Status
-	IssueEvents         map[int][]github.ListedIssueEvent
-	Commits             map[string]github.RepositoryCommit
+	Issues                     map[int]*github.Issue
+	IssueID                    int
+	OrgMembers                 map[string][]string
+	Collaborators              []string
+	IssueComments              map[int][]github.IssueComment
+	IssueCommentID             int
+	PullRequests               map[int]*github.PullRequest
+	PullRequestChanges         map[int][]github.PullRequestChange
+	PullRequestComments        map[int][]github.ReviewComment
+	PullRequestReviewCommentID int
+	PullRequestReviewComments  map[int][]github.ReviewComment
+	ReviewID                   int
+	Reviews                    map[int][]github.Review
+	CombinedStatuses           map[string]*github.CombinedStatus
+	CreatedStatuses            map[string][]github.Status
+	IssueEvents                map[int][]github.ListedIssueEvent
+	Commits                    map[string]github.RepositoryCommit
 
 	// All Labels That Exist In The Repo
 	RepoLabelsExisting []string
@@ -67,6 +69,9 @@ type FakeClient struct {
 	IssueCommentsAdded []string
 	// org/repo#issuecommentid
 	IssueCommentsDeleted []string
+
+	// org/repo#number:body
+	PullRequestReviewCommentsAdded []string
 
 	// org/repo#issuecommentid:reaction
 	IssueReactionsAdded   []string
@@ -368,6 +373,18 @@ func (f *FakeClient) CreateIssue(org, repo, title, body string, milestone int, l
 	return new.ID, nil
 }
 
+func (f *FakeClient) CloseIssue(org, repo string, number int) error {
+	f.lock.Lock()
+	defer f.lock.Unlock()
+
+	if _, ok := f.Issues[number]; !ok {
+		return fmt.Errorf("issue number %d does not exist", number)
+	}
+
+	f.Issues[number].State = "closed"
+	return nil
+}
+
 // GetPullRequestChanges returns the file modifications in a PR.
 func (f *FakeClient) GetPullRequestChanges(org, repo string, number int) ([]github.PullRequestChange, error) {
 	f.lock.RLock()
@@ -447,6 +464,15 @@ func (f *FakeClient) GetRepoLabels(owner, repo string) ([]github.Label, error) {
 		la = append(la, github.Label{Name: l})
 	}
 	return la, nil
+}
+
+// AddRepoLabel adds a defined label given org/repo
+func (f *FakeClient) AddRepoLabel(org, repo, label, description, color string) error {
+	f.lock.RLock()
+	defer f.lock.RUnlock()
+
+	f.RepoLabelsExisting = append(f.RepoLabelsExisting, label)
+	return nil
 }
 
 // GetIssueLabels gets labels on an issue
@@ -952,4 +978,14 @@ func (f *FakeClient) GetDirectory(org, repo, dir, commit string) ([]github.Direc
 	}
 
 	return nil, fmt.Errorf("could not find dir %s with ref %s", dir, commit)
+}
+
+// CreatePullRequestReviewComment adds a comment on a PR.
+func (f *FakeClient) CreatePullRequestReviewComment(owner, repo string, number int, rc github.ReviewComment) error {
+	f.lock.Lock()
+	defer f.lock.Unlock()
+	f.PullRequestReviewCommentID++
+	f.PullRequestReviewCommentsAdded = append(f.PullRequestReviewCommentsAdded, fmt.Sprintf("%s/%s#%d:%s", owner, repo, number, rc.Body))
+	f.PullRequestReviewComments[number] = append(f.PullRequestReviewComments[number], rc)
+	return nil
 }

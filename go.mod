@@ -11,7 +11,6 @@ replace github.com/golang/lint => golang.org/x/lint v0.0.0-20190301231843-5614ed
 replace (
 	cloud.google.com/go/pubsub => cloud.google.com/go/pubsub v1.3.1
 	github.com/Azure/go-autorest => github.com/Azure/go-autorest v14.2.0+incompatible
-	github.com/docker/docker => github.com/docker/docker v1.4.2-0.20200203170920-46ec8731fbce
 	github.com/googleapis/gnostic => github.com/googleapis/gnostic v0.4.1
 	golang.org/x/lint => golang.org/x/lint v0.0.0-20190409202823-959b441ac422
 	gopkg.in/yaml.v3 => gopkg.in/yaml.v3 v3.0.0-20190709130402-674ba3eaed22
@@ -19,25 +18,25 @@ replace (
 )
 
 require (
+	cloud.google.com/go v0.66.0
 	cloud.google.com/go/pubsub v1.4.0
 	cloud.google.com/go/storage v1.12.0
 	github.com/Azure/azure-sdk-for-go v42.3.0+incompatible
 	github.com/Azure/azure-storage-blob-go v0.8.0
 	github.com/Azure/go-autorest/autorest v0.11.1
 	github.com/Azure/go-autorest/autorest/adal v0.9.5
-	github.com/GoogleCloudPlatform/testgrid v0.0.30
+	github.com/GoogleCloudPlatform/testgrid v0.0.58
 	github.com/NYTimes/gziphandler v0.0.0-20170623195520-56545f4a5d46
 	github.com/andygrunwald/go-gerrit v0.0.0-20190120104749-174420ebee6c
 	github.com/andygrunwald/go-jira v1.13.0
 	github.com/aws/aws-sdk-go v1.31.12
-	github.com/bazelbuild/buildtools v0.0.0-20190917191645-69366ca98f89
+	github.com/bazelbuild/buildtools v0.0.0-20200922170545-10384511ce98
 	github.com/blang/semver v3.5.1+incompatible
 	github.com/bwmarrin/snowflake v0.0.0
 	github.com/clarketm/json v1.13.4
 	github.com/client9/misspell v0.3.4
 	github.com/dgrijalva/jwt-go/v4 v4.0.0-preview1
 	github.com/djherbis/atime v1.0.0
-	github.com/docker/docker v1.13.1
 	github.com/evanphx/json-patch v4.9.0+incompatible
 	github.com/felixge/fgprof v0.9.1
 	github.com/fsnotify/fsnotify v1.4.9
@@ -62,7 +61,6 @@ require (
 	github.com/jinzhu/gorm v1.9.12
 	github.com/klauspost/pgzip v1.2.1
 	github.com/mattn/go-zglob v0.0.2
-	github.com/mohae/deepcopy v0.0.0-20170929034955-c48cc78d4826
 	github.com/pelletier/go-toml v1.8.0
 	github.com/peterbourgon/diskv v2.0.1+incompatible
 	github.com/pkg/errors v0.9.1
@@ -76,6 +74,7 @@ require (
 	github.com/spf13/pflag v1.0.5
 	github.com/tektoncd/pipeline v0.13.1-0.20200625065359-44f22a067b75
 	go.uber.org/zap v1.15.0
+	go4.org v0.0.0-20201209231011-d4a079459e60
 	gocloud.dev v0.19.0
 	golang.org/x/crypto v0.0.0-20201002170205-7f63de1d35b0
 	golang.org/x/lint v0.0.0-20200302205851-738671d3881b
@@ -85,6 +84,7 @@ require (
 	golang.org/x/time v0.0.0-20200630173020-3af7569d3a1e
 	golang.org/x/tools v0.0.0-20200918232735-d647fc253266
 	google.golang.org/api v0.32.0
+	google.golang.org/genproto v0.0.0-20201110150050-8816d57aaa9a
 	gopkg.in/fsnotify.v1 v1.4.7
 	gopkg.in/robfig/cron.v2 v2.0.0-20150107220207-be2e0b0deed5
 	gopkg.in/yaml.v2 v2.3.0
@@ -99,7 +99,7 @@ require (
 	knative.dev/pkg v0.0.0-20200711004937-22502028e31a
 	mvdan.cc/xurls/v2 v2.0.0
 	sigs.k8s.io/boskos v0.0.0-20200617235605-f289ba6555ba
-	sigs.k8s.io/controller-runtime v0.8.1-0.20210115141952-3c5b3583fd30
+	sigs.k8s.io/controller-runtime v0.8.3-0.20210301154926-12660d4f2255
 	sigs.k8s.io/yaml v1.2.0
 )
 

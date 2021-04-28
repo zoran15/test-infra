@@ -43,8 +43,8 @@ import (
 )
 
 const (
-	statusContext string = "tide"
-	statusInPool         = "In merge pool."
+	statusContext = "tide"
+	statusInPool  = "In merge pool."
 	// statusNotInPool is a format string used when a PR is not in a tide pool.
 	// The '%s' field is populated with the reason why the PR is not in a
 	// tide pool or the empty string if the reason is unknown. See requirementDiff.
@@ -79,6 +79,11 @@ type statusController struct {
 	// lastSyncStart is used to ensure that the status update period is at least
 	// the minimum status update period.
 	lastSyncStart time.Time
+
+	// dontUpdateStatus contains all PRs for which the Tide sync controller
+	// updated the status to success prior to merging. As the name suggests,
+	// the status controller must not update their status.
+	dontUpdateStatus threadSafePRSet
 
 	sync.Mutex
 	poolPRs          map[string]PullRequest
@@ -385,7 +390,7 @@ func (sc *statusController) setStatuses(all []PullRequest, pool map[string]PullR
 			log.WithField("original-desc", original).Warn("GitHub status description needed to be truncated to fit GH API limit")
 		}
 		actualState = githubql.StatusState(strings.ToLower(string(actualState)))
-		if wantState != string(actualState) || wantDesc != actualDesc {
+		if !sc.dontUpdateStatus.has(string(pr.Repository.Owner.Login), string(pr.Repository.Name), int(pr.Number)) && (wantState != string(actualState) || wantDesc != actualDesc) {
 			if err := sc.ghc.CreateStatus(
 				org,
 				repo,
@@ -641,4 +646,37 @@ func contextCheckerGetterFactory(cfg *config.Config, gc git.ClientFactory, org, 
 		contextPolicy.RequiredContexts = requiredContexts
 		return contextPolicy, nil
 	}
+}
+
+type pullRequestIdentifier struct {
+	org    string
+	repo   string
+	number int
+}
+
+type threadSafePRSet struct {
+	data map[pullRequestIdentifier]struct{}
+	lock sync.RWMutex
+}
+
+func (s *threadSafePRSet) reset() {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	s.data = map[pullRequestIdentifier]struct{}{}
+}
+
+func (s *threadSafePRSet) has(org, repo string, number int) bool {
+	s.lock.RLock()
+	defer s.lock.RUnlock()
+	_, ok := s.data[pullRequestIdentifier{org: org, repo: repo, number: number}]
+	return ok
+}
+
+func (s *threadSafePRSet) insert(org, repo string, number int) {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	if s.data == nil {
+		s.data = map[pullRequestIdentifier]struct{}{}
+	}
+	s.data[pullRequestIdentifier{org: org, repo: repo, number: number}] = struct{}{}
 }

@@ -85,6 +85,10 @@ type HookClient interface {
 	CreateRepoHook(org, repo string, req HookRequest) (int, error)
 	DeleteOrgHook(org string, id int, req HookRequest) error
 	DeleteRepoHook(org, repo string, id int, req HookRequest) error
+	ListCurrentUserRepoInvitations() ([]UserRepoInvitation, error)
+	AcceptUserRepoInvitation(invitationID int) error
+	ListCurrentUserOrgInvitations() ([]UserOrgInvitation, error)
+	AcceptUserOrgInvitation(org string) error
 }
 
 // CommentClient interface for comment related API actions
@@ -123,6 +127,7 @@ type PullRequestClient interface {
 	UpdatePullRequest(org, repo string, number int, title, body *string, open *bool, branch *string, canModify *bool) error
 	GetPullRequestChanges(org, repo string, number int) ([]PullRequestChange, error)
 	ListPullRequestComments(org, repo string, number int) ([]ReviewComment, error)
+	CreatePullRequestReviewComment(org, repo string, number int, rc ReviewComment) error
 	ListReviews(org, repo string, number int) ([]Review, error)
 	ClosePR(org, repo string, number int) error
 	ReopenPR(org, repo string, number int) error
@@ -144,6 +149,7 @@ type CommitClient interface {
 	ListCheckRuns(org, repo, ref string) (*CheckRunList, error)
 	GetRef(org, repo, ref string) (string, error)
 	DeleteRef(org, repo, ref string) error
+	ListFileCommits(org, repo, path string) ([]RepositoryCommit, error)
 }
 
 // RepositoryClient interface for repository related API actions
@@ -389,7 +395,17 @@ type throttlerDelegate struct {
 }
 
 func (t *throttler) Wait() {
+	start := time.Now()
 	log := logrus.WithFields(logrus.Fields{"client": "github", "throttled": true})
+	defer func() {
+		waitTime := time.Since(start)
+		switch {
+		case waitTime > 15*time.Minute:
+			log.WithField("throttle-duration", waitTime.String()).Warn("Throttled clientside for more than 15 minutes")
+		case waitTime > time.Minute:
+			log.WithField("throttle-duration", waitTime.String()).Debug("Throttled clientside for more than a minute")
+		}
+	}()
 	t.lock.RLock()
 	defer t.lock.RUnlock()
 	var more bool
@@ -881,12 +897,21 @@ func (c *client) requestRetry(method, path, accept, org string, body interface{}
 						resp.Body.Close()
 						break
 					}
-				} else if oauthScopes := resp.Header.Get("X-Accepted-OAuth-Scopes"); len(oauthScopes) > 0 {
+				} else {
+					acceptedScopes := resp.Header.Get("X-Accepted-OAuth-Scopes")
 					authorizedScopes := resp.Header.Get("X-OAuth-Scopes")
 					if authorizedScopes == "" {
 						authorizedScopes = "no"
 					}
-					err = fmt.Errorf("the account is using %s oauth scopes, please make sure you are using at least one of the following oauth scopes: %s", authorizedScopes, oauthScopes)
+
+					want := sets.NewString(strings.Split(acceptedScopes, ",")...)
+					got := strings.Split(authorizedScopes, ",")
+					if acceptedScopes != "" && !want.HasAny(got...) {
+						err = fmt.Errorf("the account is using %s oauth scopes, please make sure you are using at least one of the following oauth scopes: %s", authorizedScopes, acceptedScopes)
+					} else {
+						body, _ := ioutil.ReadAll(resp.Body)
+						err = fmt.Errorf("the GitHub API request returns a 403 error: %s", string(body))
+					}
 					resp.Body.Close()
 					break
 				}
@@ -1343,6 +1368,101 @@ func (c *client) ListOrgInvitations(org string) ([]OrgInvitation, error) {
 		return nil, err
 	}
 	return ret, nil
+}
+
+// ListCurrentUserRepoInvitations lists pending invitations for the authenticated user.
+//
+// https://docs.github.com/en/rest/reference/repos#list-repository-invitations-for-the-authenticated-user
+func (c *client) ListCurrentUserRepoInvitations() ([]UserRepoInvitation, error) {
+	c.log("ListCurrentUserRepoInvitations")
+	if c.fake {
+		return nil, nil
+	}
+	path := "/user/repository_invitations"
+	var ret []UserRepoInvitation
+	err := c.readPaginatedResults(
+		path,
+		acceptNone,
+		"",
+		func() interface{} {
+			return &[]UserRepoInvitation{}
+		},
+		func(obj interface{}) {
+			ret = append(ret, *(obj.(*[]UserRepoInvitation))...)
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+	return ret, nil
+}
+
+// AcceptUserRepoInvitation accepts invitation for the authenticated user.
+//
+// https://docs.github.com/en/rest/reference/repos#accept-a-repository-invitation
+func (c *client) AcceptUserRepoInvitation(invitationID int) error {
+	c.log("AcceptUserRepoInvitation", invitationID)
+
+	_, err := c.request(&request{
+		method:    http.MethodPatch,
+		path:      fmt.Sprintf("/user/repository_invitations/%d", invitationID),
+		org:       "",
+		exitCodes: []int{204},
+	}, nil)
+
+	return err
+}
+
+// ListCurrentUserOrgInvitations lists org invitation for the authenticated user.
+//
+// https://docs.github.com/en/rest/reference/orgs#get-organization-membership-for-a-user
+func (c *client) ListCurrentUserOrgInvitations() ([]UserOrgInvitation, error) {
+	c.log("ListCurrentUserOrgInvitations")
+	if c.fake {
+		return nil, nil
+	}
+	path := "/user/memberships/orgs"
+	var ret []UserOrgInvitation
+	err := c.readPaginatedResultsWithValues(
+		path,
+		url.Values{
+			"per_page": []string{"100"},
+			"state":    []string{"pending"},
+		},
+		acceptNone,
+		"",
+		func() interface{} {
+			return &[]UserOrgInvitation{}
+		},
+		func(obj interface{}) {
+			for _, uoi := range *(obj.(*[]UserOrgInvitation)) {
+				if uoi.State == "pending" {
+					ret = append(ret, uoi)
+				}
+			}
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+	return ret, nil
+}
+
+// AcceptUserOrgInvitation accepts org invitation for the authenticated user.
+//
+// https://docs.github.com/en/rest/reference/orgs#update-an-organization-membership-for-the-authenticated-user
+func (c *client) AcceptUserOrgInvitation(org string) error {
+	c.log("AcceptUserOrgInvitation", org)
+
+	_, err := c.request(&request{
+		method:      http.MethodPatch,
+		path:        fmt.Sprintf("/user/memberships/orgs/%s", org),
+		org:         org,
+		requestBody: map[string]string{"state": "active"},
+		exitCodes:   []int{200},
+	}, nil)
+
+	return err
 }
 
 // ListOrgMembers list all users who are members of an organization. If the authenticated
@@ -1921,7 +2041,7 @@ func (c *client) CreatePullRequest(org, repo, title, body, head, base string, ca
 		exitCodes:   []int{201},
 	}, &resp)
 	if err != nil {
-		return 0, fmt.Errorf("failed to create pull request against %s/%s#%s from %s: %v", org, repo, head, base, err)
+		return 0, fmt.Errorf("failed to create pull request against %s/%s#%s from head %s: %v", org, repo, base, head, err)
 	}
 	return resp.Num, nil
 }
@@ -2231,7 +2351,7 @@ func (c *client) GetSingleCommit(org, repo, SHA string) (RepositoryCommit, error
 //
 // See https://developer.github.com/v3/repos/branches/#list-branches
 func (c *client) GetBranches(org, repo string, onlyProtected bool) ([]Branch, error) {
-	durationLogger := c.log("GetBranches", org, repo)
+	durationLogger := c.log("GetBranches", org, repo, onlyProtected)
 	defer durationLogger()
 
 	var branches []Branch
@@ -2968,6 +3088,35 @@ func (c *client) DeleteRef(org, repo, ref string) error {
 	return err
 }
 
+// ListFileCommits returns the commits for this file path.
+//
+// See https://developer.github.com/v3/repos/#list-commits
+func (c *client) ListFileCommits(org, repo, filePath string) ([]RepositoryCommit, error) {
+	durationLogger := c.log("ListFileCommits", org, repo, filePath)
+	defer durationLogger()
+
+	var commits []RepositoryCommit
+	err := c.readPaginatedResultsWithValues(
+		fmt.Sprintf("/repos/%s/%s/commits", org, repo),
+		url.Values{
+			"path":     []string{filePath},
+			"per_page": []string{"100"},
+		},
+		acceptNone,
+		org,
+		func() interface{} { // newObj
+			return &[]RepositoryCommit{}
+		},
+		func(obj interface{}) {
+			commits = append(commits, *(obj.(*[]RepositoryCommit))...)
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+	return commits, nil
+}
+
 // FindIssues uses the GitHub search API to find issues which match a particular query.
 //
 // Input query the same way you would into the website.
@@ -3581,7 +3730,8 @@ func (c *client) EnsureFork(forkingUser, org, repo string) (string, error) {
 	if err != nil {
 		return repo, fmt.Errorf("could not fetch all existing repos: %v", err)
 	}
-	if !repoExists(fork, repos) {
+	// if the repo does not exist, or it does, but is not a fork of the repo we want
+	if forkedRepo := getFork(fork, repos); forkedRepo == nil || forkedRepo.Parent.FullName != fmt.Sprintf("%s/%s", org, repo) {
 		if name, err := c.CreateFork(org, repo); err != nil {
 			return repo, fmt.Errorf("cannot fork %s/%s: %v", org, repo, err)
 		} else {
@@ -3614,7 +3764,7 @@ func (c *client) waitForRepo(owner, name string) error {
 				continue
 			}
 			ghErr = ""
-			if repoExists(owner+"/"+name, []Repo{repo.Repo}) {
+			if forkedRepo := getFork(owner+"/"+name, []Repo{repo.Repo}); forkedRepo != nil {
 				return nil
 			}
 		case <-after:
@@ -3623,16 +3773,16 @@ func (c *client) waitForRepo(owner, name string) error {
 	}
 }
 
-func repoExists(repo string, repos []Repo) bool {
+func getFork(repo string, repos []Repo) *Repo {
 	for _, r := range repos {
 		if !r.Fork {
 			continue
 		}
 		if r.FullName == repo {
-			return true
+			return &r
 		}
 	}
-	return false
+	return nil
 }
 
 // ListRepoTeams gets a list of all the teams with access to a repository
@@ -4108,6 +4258,7 @@ func (c *client) ListCheckRuns(org, repo, ref string) (*CheckRunList, error) {
 
 	var checkRunList CheckRunList
 	_, err := c.request(&request{
+		accept:    "application/vnd.github.antiope-preview+json",
 		method:    http.MethodGet,
 		path:      fmt.Sprintf("/repos/%s/%s/commits/%s/check-runs", org, repo, ref),
 		org:       org,
@@ -4212,4 +4363,29 @@ func (c *client) GetDirectory(org, repo, dirpath, commit string) ([]DirectoryCon
 	}
 
 	return res, nil
+}
+
+// CreatePullRequestReviewComment creates a review comment on a PR.
+//
+// See also: https://docs.github.com/en/rest/reference/pulls#create-a-review-comment-for-a-pull-request
+func (c *client) CreatePullRequestReviewComment(org, repo string, number int, rc ReviewComment) error {
+	c.log("CreatePullRequestReviewComment", org, repo, number, rc)
+
+	// TODO: remove custom Accept headers when their respective API fully launches.
+	acceptHeaders := []string{
+		// https://developer.github.com/changes/2016-05-12-reactions-api-preview/
+		"application/vnd.github.squirrel-girl-preview",
+		// https://developer.github.com/changes/2019-10-03-multi-line-comments/
+		"application/vnd.github.comfort-fade-preview+json",
+	}
+
+	_, err := c.request(&request{
+		method:      http.MethodPost,
+		accept:      strings.Join(acceptHeaders, ", "),
+		path:        fmt.Sprintf("/repos/%s/%s/pulls/%d/comments", org, repo, number),
+		org:         org,
+		requestBody: &rc,
+		exitCodes:   []int{201},
+	}, nil)
+	return err
 }

@@ -738,10 +738,11 @@ func TestSetStatuses(t *testing.T) {
 	testcases := []struct {
 		name string
 
-		inPool     bool
-		hasContext bool
-		state      githubql.StatusState
-		desc       string
+		inPool          bool
+		hasContext      bool
+		inDontSetStatus bool
+		state           githubql.StatusState
+		desc            string
 
 		shouldSet bool
 	}{
@@ -782,6 +783,17 @@ func TestSetStatuses(t *testing.T) {
 			desc:       statusInPool,
 
 			shouldSet: true,
+		},
+		{
+			name: "in pool with wrong state but set to not update status",
+
+			inPool:          true,
+			hasContext:      true,
+			inDontSetStatus: true,
+			state:           githubql.StatusStatePending,
+			desc:            statusInPool,
+
+			shouldSet: false,
 		},
 		{
 			name: "not in pool with proper context",
@@ -845,6 +857,9 @@ func TestSetStatuses(t *testing.T) {
 		sc, err := newStatusController(context.Background(), log, fc, newFakeManager(), nil, ca.Config, nil, "", mmc)
 		if err != nil {
 			t.Fatalf("failed to get statusController: %v", err)
+		}
+		if tc.inDontSetStatus {
+			sc.dontUpdateStatus = threadSafePRSet{data: map[pullRequestIdentifier]struct{}{{}: {}}}
 		}
 		sc.setStatuses([]PullRequest{pr}, pool, blockers.Blockers{}, nil, nil)
 		if str, err := log.String(); err != nil {
@@ -1038,9 +1053,7 @@ func TestIndexFuncPassingJobs(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			var results []string
-			for _, result := range indexFuncPassingJobs(tc.pj) {
-				results = append(results, result)
-			}
+			results = append(results, indexFuncPassingJobs(tc.pj)...)
 			if diff := deep.Equal(tc.expected, results); diff != nil {
 				t.Errorf("expected does not match result, diff: %v", diff)
 			}
